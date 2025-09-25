@@ -1,0 +1,10 @@
+
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+
+# Environment files
+.env
+storage-*.json
+package-lock.json
