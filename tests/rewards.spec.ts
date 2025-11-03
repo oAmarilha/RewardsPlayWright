@@ -1,5 +1,9 @@
 import 'dotenv/config';
-import { test, request, Browser, BrowserContext, chromium, Page, APIRequestContext, devices } from '@playwright/test';
+import { chromium } from 'playwright-extra';
+import stealth from 'puppeteer-extra-plugin-stealth';
+import { test, request, Browser, BrowserContext,Page, APIRequestContext, devices } from '@playwright/test';
+
+chromium.use(stealth());
 
 test('desktop parallel then mobile reusing credentials', async () => {
     // Prepare API and word list
@@ -22,8 +26,36 @@ test('desktop parallel then mobile reusing credentials', async () => {
 
     // Run two desktop browsers in parallel, each logs in and performs searches, then saves storage state
     await Promise.all(users.map(async (u) => {
-        const browser: Browser = await chromium.launch();
-        const context: BrowserContext = await browser.newContext();
+        const browser: Browser = await chromium.launch(
+            {
+                headless: false,
+                args: [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=VizDisplayCompositor',
+                    '--disable-dev-shm-usage',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials',
+                    '--disable-ipc-flooding-protection',
+                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                ]
+            }
+        );
+        const context: BrowserContext = await browser.newContext({
+            locale: 'pt-BR', // Set Portuguese-Brazil locale
+            // You can also set other regional preferences
+            timezoneId: 'America/Sao_Paulo',
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            geolocation: { latitude: -23.5505, longitude: -46.6333 }, // São Paulo coordinates
+            permissions: ['geolocation']
+        });
+        // Remove webdriver property
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+        });
         const page: Page = await context.newPage();
         await page.goto('https://bing.com/');
         await page.waitForLoadState('networkidle');
@@ -37,10 +69,37 @@ test('desktop parallel then mobile reusing credentials', async () => {
 
     // After both desktop runs finish, start the two mobile browsers (in parallel) with same credentials via storageState
     await Promise.all(users.map(async (u) => {
-        const browser: Browser = await chromium.launch();
+        const browser: Browser = await chromium.launch(
+            {
+                headless: false,
+                args: [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=VizDisplayCompositor',
+                    '--disable-dev-shm-usage',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials',
+                    '--disable-ipc-flooding-protection',
+                    '--user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+                ]
+            }
+        );
         const context: BrowserContext = await browser.newContext({
             ...devices['iPhone 13'],
             storageState: u.storagePath,
+            locale: 'pt-BR', // Set Portuguese-Brazil locale
+            // You can also set other regional preferences
+            timezoneId: 'America/Sao_Paulo',
+            geolocation: { latitude: -23.5505, longitude: -46.6333 }, // São Paulo coordinates
+            permissions: ['geolocation'],
+            userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+        });
+        // Remove webdriver property
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
         });
         const page: Page = await context.newPage();
         await page.goto('https://bing.com/');
@@ -77,16 +136,16 @@ async function signInDesktop(page: Page, username: string, password: string) {
         await signInBtn.click();
     }
     await page.locator('#usernameEntry').fill(username);
-    await page.getByText('Next').click();
+    await page.getByText('Avançar').click();
     // Password
     await page.locator('#passwordEntry').fill(password);
-    await page.getByText('Next').click();
+    await page.getByText('Avançar').click();
     // Post-login prompts
-    if (await page.getByText('Yes').isVisible({ timeout: 10000 })) {
-        await page.getByText('Yes').click();
+    if (await page.getByText('Sim').isVisible({ timeout: 10000 })) {
+        await page.getByText('Sim').click();
     }
-    if (await page.getByText('Skip for now').isVisible({ timeout: 10000 })) {
-        await page.getByText('Skip for now').click();
+    if (await page.getByText('Pular por enquanto').isVisible({ timeout: 10000 })) {
+        await page.getByText('Pular por enquanto').click();
     }
 }
 
@@ -104,7 +163,7 @@ async function ensureSignedInMobileIfNeeded(page: Page, username: string) {
         }
         if (await usernameEntry.isVisible().catch(() => false)) {
             await usernameEntry.fill(username);
-            await page.getByText('Next').click();
+            await page.getByText('Avançar').click();
             // Assume storageState had password session; otherwise additional steps would be needed.
         }
     }
