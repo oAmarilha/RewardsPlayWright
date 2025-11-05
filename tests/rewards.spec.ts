@@ -38,7 +38,7 @@ test('desktop parallel then mobile reusing credentials', async () => {
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--disable-site-isolation-trials',
                     '--disable-ipc-flooding-protection',
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    '--user-agent=Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0'
                 ]
             }
         );
@@ -46,7 +46,7 @@ test('desktop parallel then mobile reusing credentials', async () => {
             locale: 'pt-BR', // Set Portuguese-Brazil locale
             // You can also set other regional preferences
             timezoneId: 'America/Sao_Paulo',
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            userAgent: 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0',
             geolocation: { latitude: -23.5505, longitude: -46.6333 }, // São Paulo coordinates
             permissions: ['geolocation']
         });
@@ -81,7 +81,7 @@ test('desktop parallel then mobile reusing credentials', async () => {
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--disable-site-isolation-trials',
                     '--disable-ipc-flooding-protection',
-                    '--user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+                    '--user-agent=Mozilla/5.0 (Android 14; Mobile; rv:144.0) Gecko/144.0 Firefox/144.0'
                 ]
             }
         );
@@ -93,7 +93,7 @@ test('desktop parallel then mobile reusing credentials', async () => {
             timezoneId: 'America/Sao_Paulo',
             geolocation: { latitude: -23.5505, longitude: -46.6333 }, // São Paulo coordinates
             permissions: ['geolocation'],
-            userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+            userAgent: 'Mozilla/5.0 (Android 14; Mobile; rv:144.0) Gecko/144.0 Firefox/144.0'
         });
         // Remove webdriver property
         await context.addInitScript(() => {
