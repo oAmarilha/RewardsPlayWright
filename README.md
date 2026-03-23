@@ -7,6 +7,7 @@ Automated multi-session browsing with Playwright to run Bing searches and collec
 - **Sequenced mobile runs**: Two iPhone 13–emulated sessions start after both desktop runs finish.
 - **Validated session reuse**: Desktop sessions first validate the existing `storage-*.json` files and skip login when the stored state is still usable.
 - **Mobile session refresh**: Mobile runs start from the desktop storage state, sign out inside the mobile tab, then sign back in through the mobile UI so the session is refreshed for the mobile viewport.
+- **Verbose runtime logging**: Live logs show storage reuse decisions, cookie validity summaries, login steps, desktop/mobile search counters, cooldowns, and reloads.
 - **Configurable via .env**: Control credentials and search settings without code changes.
 - **Resilient sign-in flow**: Handles cookies, remembered-account pickers, and typical Microsoft post‑login prompts (e.g., "Yes", "Skip for now").
 
@@ -78,6 +79,8 @@ To override credentials without a `.env` file:
 ```bash
 USER1='user1@example.com' PASS1='password1' USER2='user2@example.com' PASS2='password2' npx playwright test tests/rewards.spec.ts
 ```
+
+The run now prints live progress to stdout, including whether stored cookies will be reused, how many valid cookies were found, which login path was taken, and the current desktop/mobile search number.
 
 ## ⚙️ How It Works
 1. Loads credentials and configuration using `dotenv`.

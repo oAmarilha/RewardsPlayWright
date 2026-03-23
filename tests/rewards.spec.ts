@@ -13,8 +13,10 @@ chromium.use(stealthPlugin);
 const BING_URL = 'https://www.bing.com/';
 const DESKTOP_USER_AGENT = 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0';
 const MOBILE_USER_AGENT = 'Mozilla/5.0 (Android 14; Mobile; rv:144.0) Gecko/144.0 Firefox/144.0';
+const AUTH_COOKIE_NAMES = new Set(['_C_Auth', 'MSPAuth', 'MSPProf', 'RPSSecAuth']);
 
 type RewardUser = {
+    label: string;
     username: string;
     password: string;
     storagePath: string;
@@ -39,23 +41,40 @@ type StoredCookie = {
     expires?: number;
 };
 
+type StorageInspection = {
+    reusable: boolean;
+    reason: string;
+    totalCookies: number;
+    reusableCookies: number;
+    expiredCookies: number;
+    validAuthCookies: string[];
+};
+
+type RunLogger = (message: string) => void;
+
 test('desktop reuses valid storage, then refreshes the same session in mobile view', async () => {
+    const setupLog = createRunLogger('setup');
+    setupLog('Starting Bing Rewards Playwright run');
+
     // Prepare API and word list
     const api: APIRequestContext = await request.newContext({ baseURL: 'https://api.datamuse.com/', timeout: 10000 });
+    setupLog(`Fetching keyword pool from Datamuse for "${process.env.KEYWORD_SEARCH}"`);
     const words = await api.get(`words?ml=${process.env.KEYWORD_SEARCH}`);
     const words_response = await words.json() as Array<{ word: string }>;
     const words_array: string[] = words_response.map((wordObj) => wordObj.word);
+    setupLog(`Loaded ${words_array.length} candidate words`);
 
     // Credentials via environment variables
     const users: RewardUser[] = [
-        { username: process.env.USER1, password: process.env.PASS1, storagePath: 'storage-user1.json' },
-        { username: process.env.USER2, password: process.env.PASS2, storagePath: 'storage-user2.json' },
+        { label: 'user1', username: process.env.USER1, password: process.env.PASS1, storagePath: 'storage-user1.json' },
+        { label: 'user2', username: process.env.USER2, password: process.env.PASS2, storagePath: 'storage-user2.json' },
     ].map((user, idx) => {
         if (!user.username || !user.password) {
             throw new Error(`Missing USER${idx + 1}/PASS${idx + 1} environment variables`);
         }
 
         return {
+            label: user.label,
             username: user.username,
             password: user.password,
             storagePath: user.storagePath,
@@ -64,12 +83,22 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
 
     const desktopSearches = getSearchOptions(parseRequiredNumberEnv('DESKTOP_SEARCHES'));
     const mobileSearches = getSearchOptions(parseRequiredNumberEnv('MOBILE_SEARCHES'), true);
+    setupLog(`Desktop searches: total=${desktopSearches.total}, wait=${desktopSearches.waitMs}ms, cooldownEvery=${desktopSearches.cooldownEvery}, cooldown=${desktopSearches.cooldownMs}ms`);
+    setupLog(`Mobile searches: total=${mobileSearches.total}, wait=${mobileSearches.waitMs}ms, cooldownEvery=${mobileSearches.cooldownEvery}, cooldown=${mobileSearches.cooldownMs}ms, reloadBetween=${mobileSearches.reloadBetween ? 'yes' : 'no'}`);
+    setupLog(`Accounts configured: ${users.map((user) => `${user.label}=${maskUsername(user.username)}`).join(', ')}`);
 
     // Run two desktop browsers in parallel, reusing valid storage when possible.
     await Promise.all(users.map(async (u) => {
+        const log = createRunLogger('desktop', u.label);
+        const storageInspection = await inspectStoredState(u.storagePath);
         const browser: Browser = await launchRewardsBrowser(DESKTOP_USER_AGENT);
+
         try {
-            const storageState = await isStoredStateReusable(u.storagePath) ? u.storagePath : undefined;
+            log(`Starting desktop session for ${maskUsername(u.username)}`);
+            log(describeStorageInspection(u.storagePath, storageInspection));
+            log('Launching desktop browser context');
+
+            const storageState = storageInspection.reusable ? u.storagePath : undefined;
             const context: BrowserContext = await browser.newContext({
                 locale: 'pt-BR',
                 timezoneId: 'America/Sao_Paulo',
@@ -82,26 +111,42 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
             await hardenContext(context);
 
             const page: Page = await context.newPage();
-            await openBingHome(page);
+            await openBingHome(page, log);
 
-            if (!(await isSignedInSession(page))) {
-                await signInDesktop(page, u.username, u.password);
+            if (await isSignedInSession(page)) {
+                log('Existing desktop session is already signed in');
+            } else {
+                log('Stored desktop session is not signed in; performing fresh login');
+                await signInDesktop(page, u.username, u.password, log);
             }
 
-            await runSearches(page, words_array, desktopSearches);
+            await runSearches(page, words_array, desktopSearches, log, 'desktop');
             await context.storageState({ path: u.storagePath });
+            log(`Saved desktop storage state to ${u.storagePath}`);
             await context.close();
+            log('Desktop session completed');
+        } catch (error) {
+            log(`Desktop session failed: ${formatError(error)}`);
+            throw error;
         } finally {
             await browser.close();
         }
     }));
+    setupLog('All desktop sessions finished; starting mobile refresh sessions');
 
     // After desktop finishes, reuse the stored cookies in mobile, log out in the mobile tab,
     // and log back in through the mobile UI so Microsoft issues a mobile session.
     await Promise.all(users.map(async (u) => {
+        const log = createRunLogger('mobile', u.label);
+        const storageInspection = await inspectStoredState(u.storagePath);
         const browser: Browser = await launchRewardsBrowser(MOBILE_USER_AGENT);
+
         try {
-            const storageState = await isStoredStateReusable(u.storagePath) ? u.storagePath : undefined;
+            log(`Starting mobile session for ${maskUsername(u.username)}`);
+            log(describeStorageInspection(u.storagePath, storageInspection));
+            log('Launching mobile browser context');
+
+            const storageState = storageInspection.reusable ? u.storagePath : undefined;
             const context: BrowserContext = await browser.newContext({
                 ...devices['iPhone 13'],
                 locale: 'pt-BR',
@@ -115,14 +160,19 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
             await hardenContext(context);
 
             const page: Page = await context.newPage();
-            await openBingHome(page);
-            await refreshMobileSession(page, u);
-            await runSearches(page, words_array, mobileSearches);
+            await openBingHome(page, log);
+            await refreshMobileSession(page, u, log);
+            await runSearches(page, words_array, mobileSearches, log, 'mobile');
             await context.close();
+            log('Mobile session completed');
+        } catch (error) {
+            log(`Mobile session failed: ${formatError(error)}`);
+            throw error;
         } finally {
             await browser.close();
         }
     }));
+    setupLog('Rewards run finished');
 });
 
 function getSearchOptions(total: number, reloadBetween = false): SearchOptions {
@@ -145,6 +195,10 @@ function parseRequiredNumberEnv(name: string): number {
 }
 
 function getRandomWords(words: string[], count: number): string[] {
+    if (words.length < count) {
+        throw new Error(`Keyword pool is too small: requested ${count} words, but only ${words.length} are available`);
+    }
+
     const selectedWords = new Set<string>();
     
     while (selectedWords.size < count) {
@@ -155,10 +209,11 @@ function getRandomWords(words: string[], count: number): string[] {
     return Array.from(selectedWords);
 }
 
-async function acceptCookiesIfVisible(page: Page) {
+async function acceptCookiesIfVisible(page: Page, log?: RunLogger) {
     const accept = page.locator('#bnp_btn_accept');
     if (await accept.isVisible().catch(() => false)) {
         await accept.click().catch(() => {});
+        emitLog(log, 'Accepted the Bing cookie banner');
     }
 }
 
@@ -186,24 +241,55 @@ async function hardenContext(context: BrowserContext) {
     });
 }
 
-async function openBingHome(page: Page) {
+async function openBingHome(page: Page, log?: RunLogger) {
+    emitLog(log, `Opening ${BING_URL}`);
     await page.goto(BING_URL, { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle').catch(() => {});
-    await acceptCookiesIfVisible(page);
+    await acceptCookiesIfVisible(page, log);
 }
 
-async function isStoredStateReusable(storagePath: string): Promise<boolean> {
+async function inspectStoredState(storagePath: string): Promise<StorageInspection> {
     try {
         const raw = await fs.readFile(storagePath, 'utf8');
         const parsed = JSON.parse(raw) as StoredState;
         if (!Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) {
-            return false;
+            return {
+                reusable: false,
+                reason: 'storage file is missing cookies/origins arrays',
+                totalCookies: 0,
+                reusableCookies: 0,
+                expiredCookies: 0,
+                validAuthCookies: [],
+            };
         }
 
         const now = Date.now() / 1000;
-        return parsed.cookies.some((cookie) => isStoredCookieReusable(cookie, now));
-    } catch {
-        return false;
+        const reusableCookies = parsed.cookies.filter((cookie) => isStoredCookieReusable(cookie, now));
+        const validAuthCookies = reusableCookies
+            .filter((cookie) => typeof cookie.name === 'string' && AUTH_COOKIE_NAMES.has(cookie.name))
+            .map((cookie) => cookie.name as string);
+
+        return {
+            reusable: reusableCookies.length > 0,
+            reason: reusableCookies.length > 0 ? 'usable cookies found' : 'all stored cookies are expired or malformed',
+            totalCookies: parsed.cookies.length,
+            reusableCookies: reusableCookies.length,
+            expiredCookies: parsed.cookies.length - reusableCookies.length,
+            validAuthCookies: Array.from(new Set(validAuthCookies)),
+        };
+    } catch (error) {
+        const message = error instanceof Error && 'code' in error && error.code === 'ENOENT'
+            ? 'storage file was not found'
+            : formatError(error);
+
+        return {
+            reusable: false,
+            reason: message,
+            totalCookies: 0,
+            reusableCookies: 0,
+            expiredCookies: 0,
+            validAuthCookies: [],
+        };
     }
 }
 
@@ -293,11 +379,12 @@ async function isSignedInSession(page: Page): Promise<boolean> {
             return false;
         }
 
-        return ['_C_Auth', 'MSPAuth', 'MSPProf', 'RPSSecAuth'].includes(cookie.name);
+        return AUTH_COOKIE_NAMES.has(cookie.name);
     });
 }
 
-async function signInDesktop(page: Page, username: string, password: string) {
+async function signInDesktop(page: Page, username: string, password: string, log?: RunLogger) {
+    emitLog(log, 'Opening desktop sign-in entry');
     const signInOpened = await clickFirstVisible([
         page.locator('#id_s').first(),
         page.getByRole('link', { name: /Entrar|Sign in/i }).first(),
@@ -308,17 +395,20 @@ async function signInDesktop(page: Page, username: string, password: string) {
         throw new Error('Desktop sign-in button not found');
     }
 
-    await finishMicrosoftLogin(page, username, password);
+    await finishMicrosoftLogin(page, username, password, false, log);
+    emitLog(log, 'Desktop sign-in completed');
 }
 
-async function signInMobile(page: Page, username: string, password: string) {
+async function signInMobile(page: Page, username: string, password: string, log?: RunLogger) {
     if (!(await hasMicrosoftLoginSurface(page, username))) {
+        emitLog(log, 'Mobile login surface not visible yet; opening hamburger sign-in entry');
         let signInOpened = await openMobileSignInEntry(page);
 
         if (!signInOpened) {
+            emitLog(log, 'Mobile sign-in entry did not appear on first attempt; reloading the page');
             await closeMobileHamburgerMenu(page);
             await page.reload({ waitUntil: 'domcontentloaded' });
-            await handlePostReload(page);
+            await handlePostReload(page, log);
             signInOpened = await openMobileSignInEntry(page);
         }
 
@@ -331,14 +421,16 @@ async function signInMobile(page: Page, username: string, password: string) {
         }
     }
 
-    await finishMicrosoftLogin(page, username, password, true);
-    await openBingHome(page);
+    await finishMicrosoftLogin(page, username, password, true, log);
+    emitLog(log, 'Mobile sign-in completed; reopening Bing home');
+    await openBingHome(page, log);
     await closeMobileHamburgerMenu(page);
 }
 
-async function refreshMobileSession(page: Page, user: RewardUser) {
-    await ensureMobileLoggedOut(page);
-    await signInMobile(page, user.username, user.password);
+async function refreshMobileSession(page: Page, user: RewardUser, log?: RunLogger) {
+    emitLog(log, 'Refreshing mobile session from stored desktop state');
+    await ensureMobileLoggedOut(page, log);
+    await signInMobile(page, user.username, user.password, log);
 }
 
 async function clickContinue(page: Page) {
@@ -378,12 +470,13 @@ async function hasMicrosoftLoginSurface(page: Page, username: string): Promise<b
     );
 }
 
-async function finishMicrosoftLogin(page: Page, username: string, password: string, preferRememberedAccount = false) {
+async function finishMicrosoftLogin(page: Page, username: string, password: string, preferRememberedAccount = false, log?: RunLogger) {
     const deadline = Date.now() + 45_000;
     let rememberedAccountAttempted = !preferRememberedAccount;
 
     while (Date.now() < deadline) {
         if (await isSignedInSession(page)) {
+            emitLog(log, 'Microsoft account reports as signed in');
             return;
         }
 
@@ -399,17 +492,20 @@ async function finishMicrosoftLogin(page: Page, username: string, password: stri
         }
 
         if (await clickStaySignedIn(page)) {
+            emitLog(log, 'Accepted the "Stay signed in" prompt');
             await settleAfterLoginAction(page);
             continue;
         }
 
         if (await clickSkipForNow(page)) {
+            emitLog(log, 'Skipped the optional "Skip for now" prompt');
             await settleAfterLoginAction(page);
             continue;
         }
 
         if (!rememberedAccountAttempted && await clickRememberedAccount(page, username)) {
             rememberedAccountAttempted = true;
+            emitLog(log, 'Selected the remembered Microsoft account');
             await settleAfterLoginAction(page);
             continue;
         }
@@ -418,13 +514,14 @@ async function finishMicrosoftLogin(page: Page, username: string, password: stri
 
         const usernameEntry = page.locator('#usernameEntry');
         if (await usernameEntry.isVisible().catch(() => false)) {
+            emitLog(log, 'Entering Microsoft username');
             await usernameEntry.fill(username);
             await clickContinue(page);
             await settleAfterLoginAction(page);
             continue;
         }
 
-        if (await submitPasswordIfRequested(page, password)) {
+        if (await submitPasswordIfRequested(page, password, log)) {
             await settleAfterLoginAction(page);
             continue;
         }
@@ -435,9 +532,10 @@ async function finishMicrosoftLogin(page: Page, username: string, password: stri
     throw new Error(`Login did not complete for ${username}`);
 }
 
-async function submitPasswordIfRequested(page: Page, password: string): Promise<boolean> {
+async function submitPasswordIfRequested(page: Page, password: string, log?: RunLogger): Promise<boolean> {
     const passwordEntry = page.locator('#passwordEntry');
     if (await passwordEntry.isVisible().catch(() => false)) {
+        emitLog(log, 'Entering Microsoft password');
         await passwordEntry.fill(password);
         await clickContinue(page);
         return true;
@@ -447,10 +545,11 @@ async function submitPasswordIfRequested(page: Page, password: string): Promise<
         return false;
     }
 
-    if (!(await revealPasswordEntry(page))) {
+    if (!(await revealPasswordEntry(page, log))) {
         return false;
     }
 
+    emitLog(log, 'Entering Microsoft password after switching login method');
     await passwordEntry.fill(password);
     await clickContinue(page);
     return true;
@@ -477,7 +576,7 @@ async function shouldAttemptPasswordReveal(page: Page): Promise<boolean> {
     return false;
 }
 
-async function revealPasswordEntry(page: Page): Promise<boolean> {
+async function revealPasswordEntry(page: Page, log?: RunLogger): Promise<boolean> {
     const passwordEntry = page.locator('#passwordEntry');
     if (await waitUntilVisible(passwordEntry, 5000)) {
         return true;
@@ -489,13 +588,23 @@ async function revealPasswordEntry(page: Page): Promise<boolean> {
         await waitAndClick(otherWaysByRole, 15000) ||
         await waitAndClick(otherWaysBySpan, 15000);
 
+    if (clickedOtherWays) {
+        emitLog(log, 'Opened the "Other ways to sign in" prompt');
+    }
+
     if (!clickedOtherWays && await waitUntilVisible(passwordEntry, 5000)) {
         return true;
     }
 
     const usePasswordByRole = page.getByRole('button', { name: /Use sua senha|Use your password/i }).first();
     const usePasswordBySpan = page.locator('span[role="button"]', { hasText: /Use sua senha|Use your password/i }).first();
-    await waitAndClick(usePasswordByRole, 10000) || await waitAndClick(usePasswordBySpan, 10000);
+    const clickedUsePassword =
+        await waitAndClick(usePasswordByRole, 10000) ||
+        await waitAndClick(usePasswordBySpan, 10000);
+
+    if (clickedUsePassword) {
+        emitLog(log, 'Switched Microsoft login to password entry');
+    }
 
     return waitUntilVisible(passwordEntry, 15000);
 }
@@ -630,19 +739,22 @@ async function openMobileSignInEntry(page: Page): Promise<boolean> {
     ], 7000);
 }
 
-async function ensureMobileLoggedOut(page: Page) {
+async function ensureMobileLoggedOut(page: Page, log?: RunLogger) {
     await closeMobileHamburgerMenu(page);
 
     if (!(await isSignedInSession(page))) {
+        emitLog(log, 'Mobile session is already logged out');
         return;
     }
 
-    await clearBingSiteData(page);
-    await openBingHome(page);
+    emitLog(log, 'Mobile session is signed in; clearing Bing site data before mobile login');
+    await clearBingSiteData(page, log);
+    await openBingHome(page, log);
     await closeMobileHamburgerMenu(page);
 }
 
-async function clearBingSiteData(page: Page) {
+async function clearBingSiteData(page: Page, log?: RunLogger) {
+    emitLog(log, 'Clearing Bing cookies, storage, caches, and service workers');
     const context = page.context();
     const cdp = await context.newCDPSession(page);
     const bingOrigins = [
@@ -678,14 +790,14 @@ async function clearBingSiteData(page: Page) {
     }).catch(() => {});
 
     await page.reload({ waitUntil: 'domcontentloaded' }).catch(async () => {
-        await openBingHome(page);
+        await openBingHome(page, log);
     });
-    await handlePostReload(page);
+    await handlePostReload(page, log);
 }
 
-async function handlePostReload(page: Page) {
+async function handlePostReload(page: Page, log?: RunLogger) {
     await page.waitForLoadState('networkidle').catch(() => {});
-    await acceptCookiesIfVisible(page);
+    await acceptCookiesIfVisible(page, log);
 }
 
 async function ensureSearchField(page: Page): Promise<Locator> {
@@ -697,21 +809,68 @@ async function ensureSearchField(page: Page): Promise<Locator> {
 async function runSearches(
     page: Page,
     wordsArray: string[],
-    opts: { total: number; waitMs: number; cooldownEvery: number; cooldownMs: number; reloadBetween?: boolean }
+    opts: { total: number; waitMs: number; cooldownEvery: number; cooldownMs: number; reloadBetween?: boolean },
+    log?: RunLogger,
+    mode = 'search'
 ) {
+    emitLog(log, `Starting ${mode} loop with ${opts.total} searches`);
     let searchField = await ensureSearchField(page);
     for (let i = 0; i < opts.total; i++) {
         const query = getRandomWords(wordsArray, 3).join(' ');
+        emitLog(log, `Search ${i + 1}/${opts.total}: "${query}"`);
         await searchField.fill(query);
         await searchField.press('Enter');
         if ((i + 1) % opts.cooldownEvery === 0) {
+            emitLog(log, `Cooldown after search ${i + 1}/${opts.total} for ${opts.cooldownMs}ms`);
             await page.waitForTimeout(opts.cooldownMs);
         }
         await page.waitForTimeout(opts.waitMs);
         if (opts.reloadBetween) {
+            emitLog(log, `Reloading page before the next ${mode} search`);
             await page.reload();
-            await handlePostReload(page);
+            await handlePostReload(page, log);
             searchField = await ensureSearchField(page);
         }
     }
+    emitLog(log, `Finished ${mode} loop`);
+}
+
+function createRunLogger(stage: string, userLabel?: string): RunLogger {
+    return (message: string) => {
+        const timestamp = new Date().toISOString();
+        const scope = userLabel ? `${stage}:${userLabel}` : stage;
+        process.stdout.write(`[${timestamp}] [${scope}] ${message}\n`);
+    };
+}
+
+function emitLog(log: RunLogger | undefined, message: string) {
+    log?.(message);
+}
+
+function describeStorageInspection(storagePath: string, inspection: StorageInspection): string {
+    const authCookieSummary = inspection.validAuthCookies.length > 0
+        ? `valid auth cookies: ${inspection.validAuthCookies.join(', ')}`
+        : 'valid auth cookies: none detected';
+
+    const reuseSummary = inspection.reusable ? 'will reuse stored cookies' : 'will start without stored cookies';
+    return `${reuseSummary} from ${storagePath}; ${inspection.reason}; total cookies=${inspection.totalCookies}, reusable=${inspection.reusableCookies}, expiredOrInvalid=${inspection.expiredCookies}, ${authCookieSummary}`;
+}
+
+function maskUsername(username: string): string {
+    const [localPart, domain] = username.split('@');
+
+    if (!domain) {
+        return `${username.slice(0, 2)}***`;
+    }
+
+    const visibleLocal = localPart.length <= 2 ? localPart[0] ?? '*' : localPart.slice(0, 2);
+    return `${visibleLocal}***@${domain}`;
+}
+
+function formatError(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message;
+    }
+
+    return String(error);
 }
