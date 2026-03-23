@@ -8,3 +8,4 @@ node_modules/
 .env
 storage-*.json
 package-lock.json
+.vscode

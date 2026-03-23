@@ -5,9 +5,10 @@ Automated multi-session browsing with Playwright to run Bing searches and collec
 ## ✨ Features
 - **Parallel desktop runs**: Two Chromium instances run at the same time.
 - **Sequenced mobile runs**: Two iPhone 13–emulated sessions start after both desktop runs finish.
-- **Session reuse**: Desktop sessions store authenticated state to `storage-*.json` files, reused by mobile sessions.
+- **Validated session reuse**: Desktop sessions first validate the existing `storage-*.json` files and skip login when the stored state is still usable.
+- **Mobile session refresh**: Mobile runs start from the desktop storage state, sign out inside the mobile tab, then sign back in through the mobile UI so the session is refreshed for the mobile viewport.
 - **Configurable via .env**: Control credentials and search settings without code changes.
-- **Resilient sign-in flow**: Handles cookies and typical Microsoft post‑login prompts (e.g., "Yes", "Skip for now").
+- **Resilient sign-in flow**: Handles cookies, remembered-account pickers, and typical Microsoft post‑login prompts (e.g., "Yes", "Skip for now").
 
 ## 📁 Repository Structure
 - `tests/rewards.spec.ts` – Main Playwright test orchestrating the desktop → mobile flow.
@@ -84,15 +85,17 @@ USER1='user1@example.com' PASS1='password1' USER2='user2@example.com' PASS2='pas
 3. Launches two desktop Chromium sessions in parallel.
    - Navigates to `https://bing.com/`
    - Accepts cookies if prompted
-   - Signs in with `USER1` and `USER2`
+   - Reuses `storage-user*.json` when it is still valid; otherwise signs in with `USER1` and `USER2`
    - Performs `DESKTOP_SEARCHES` random queries
    - Saves storage state to `storage-user1.json` and `storage-user2.json`
 4. Launches two iPhone 13–emulated sessions in parallel.
-   - Uses the saved storage states for sign‑in
+   - Loads the saved desktop storage state
+   - Signs out in the mobile tab, then signs back in from the mobile UI so Microsoft refreshes the session for mobile
    - Performs `MOBILE_SEARCHES` random queries (with optional page reloads)
 
 ## 🗂️ Storage State
 - Auth states are persisted to `storage-user1.json` and `storage-user2.json` in the project root.
+- When those files still contain usable cookies, the desktop flow reuses them instead of forcing a new login.
 - These files are ignored by Git to protect your sessions.
 
 ## 🧩 Tips
