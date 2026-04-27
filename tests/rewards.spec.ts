@@ -19,7 +19,8 @@ type RewardUser = {
     label: string;
     username: string;
     password: string;
-    storagePath: string;
+    desktopStoragePath: string;
+    mobileStoragePath: string;
 };
 
 type SearchOptions = {
@@ -52,7 +53,7 @@ type StorageInspection = {
 
 type RunLogger = (message: string) => void;
 
-test('desktop reuses valid storage, then refreshes the same session in mobile view', async () => {
+test('desktop and mobile reuse their own valid storage states', async () => {
     const setupLog = createRunLogger('setup');
     setupLog('Starting Bing Rewards Playwright run');
 
@@ -66,8 +67,20 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
 
     // Credentials via environment variables
     const users: RewardUser[] = [
-        { label: 'user1', username: process.env.USER1, password: process.env.PASS1, storagePath: 'storage-user1.json' },
-        { label: 'user2', username: process.env.USER2, password: process.env.PASS2, storagePath: 'storage-user2.json' },
+        {
+            label: 'user1',
+            username: process.env.USER1,
+            password: process.env.PASS1,
+            desktopStoragePath: 'storage-user1.json',
+            mobileStoragePath: 'storage-user1-mobile.json',
+        },
+        {
+            label: 'user2',
+            username: process.env.USER2,
+            password: process.env.PASS2,
+            desktopStoragePath: 'storage-user2.json',
+            mobileStoragePath: 'storage-user2-mobile.json',
+        },
     ].map((user, idx) => {
         if (!user.username || !user.password) {
             throw new Error(`Missing USER${idx + 1}/PASS${idx + 1} environment variables`);
@@ -77,7 +90,8 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
             label: user.label,
             username: user.username,
             password: user.password,
-            storagePath: user.storagePath,
+            desktopStoragePath: user.desktopStoragePath,
+            mobileStoragePath: user.mobileStoragePath,
         };
     });
 
@@ -90,15 +104,15 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
     // Run two desktop browsers in parallel, reusing valid storage when possible.
     await Promise.all(users.map(async (u) => {
         const log = createRunLogger('desktop', u.label);
-        const storageInspection = await inspectStoredState(u.storagePath);
+        const storageInspection = await inspectStoredState(u.desktopStoragePath);
         const browser: Browser = await launchRewardsBrowser(DESKTOP_USER_AGENT);
 
         try {
             log(`Starting desktop session for ${maskUsername(u.username)}`);
-            log(describeStorageInspection(u.storagePath, storageInspection));
+            log(describeStorageInspection(u.desktopStoragePath, storageInspection));
             log('Launching desktop browser context');
 
-            const storageState = storageInspection.reusable ? u.storagePath : undefined;
+            const storageState = storageInspection.reusable ? u.desktopStoragePath : undefined;
             const context: BrowserContext = await browser.newContext({
                 locale: 'pt-BR',
                 timezoneId: 'America/Sao_Paulo',
@@ -121,8 +135,8 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
             }
 
             await runSearches(page, words_array, desktopSearches, log, 'desktop');
-            await context.storageState({ path: u.storagePath });
-            log(`Saved desktop storage state to ${u.storagePath}`);
+            await context.storageState({ path: u.desktopStoragePath });
+            log(`Saved desktop storage state to ${u.desktopStoragePath}`);
             await context.close();
             log('Desktop session completed');
         } catch (error) {
@@ -132,43 +146,55 @@ test('desktop reuses valid storage, then refreshes the same session in mobile vi
             await browser.close();
         }
     }));
-    setupLog('All desktop sessions finished; starting mobile refresh sessions');
+    setupLog('All desktop sessions finished; starting mobile sessions');
 
-    // After desktop finishes, reuse the stored cookies in mobile, log out in the mobile tab,
-    // and log back in through the mobile UI so Microsoft issues a mobile session.
+    // After desktop finishes, mobile uses its own storage state. If there is no
+    // reusable mobile state, start clean and save a new mobile-specific state.
     await Promise.all(users.map(async (u) => {
         const log = createRunLogger('mobile', u.label);
-        const storageInspection = await inspectStoredState(u.storagePath);
+        const storageInspection = await inspectStoredState(u.mobileStoragePath);
         const browser: Browser = await launchRewardsBrowser(MOBILE_USER_AGENT);
+        let context: BrowserContext | undefined;
 
         try {
             log(`Starting mobile session for ${maskUsername(u.username)}`);
-            log(describeStorageInspection(u.storagePath, storageInspection));
+            log(describeStorageInspection(u.mobileStoragePath, storageInspection));
             log('Launching mobile browser context');
 
-            const storageState = storageInspection.reusable ? u.storagePath : undefined;
-            const context: BrowserContext = await browser.newContext({
-                ...devices['iPhone 13'],
-                locale: 'pt-BR',
-                timezoneId: 'America/Sao_Paulo',
-                geolocation: { latitude: -23.5505, longitude: -46.6333 },
-                permissions: ['geolocation'],
-                userAgent: MOBILE_USER_AGENT,
-                ...(storageState ? { storageState } : {}),
-            });
-
-            await hardenContext(context);
-
-            const page: Page = await context.newPage();
+            const storageState = storageInspection.reusable ? u.mobileStoragePath : undefined;
+            context = await createMobileContext(browser, storageState);
+            let page: Page = await context.newPage();
             await openBingHome(page, log);
-            await refreshMobileSession(page, u, log);
+
+            if (await isSignedInSession(page)) {
+                log('Existing mobile session is already signed in');
+            } else {
+                if (storageState) {
+                    log('Stored mobile session is not signed in; restarting with a clean mobile session');
+                    await context.close();
+                    context = await createMobileContext(browser);
+                    page = await context.newPage();
+                    await openBingHome(page, log);
+                } else {
+                    log('No reusable mobile storage found; starting with a clean mobile session');
+                }
+
+                await signInMobile(page, u.username, u.password, log);
+                await context.storageState({ path: u.mobileStoragePath });
+                log(`Saved mobile storage state to ${u.mobileStoragePath} after login`);
+            }
+
             await runSearches(page, words_array, mobileSearches, log, 'mobile');
+            await context.storageState({ path: u.mobileStoragePath });
+            log(`Saved mobile storage state to ${u.mobileStoragePath}`);
             await context.close();
+            context = undefined;
             log('Mobile session completed');
         } catch (error) {
             log(`Mobile session failed: ${formatError(error)}`);
             throw error;
         } finally {
+            await context?.close().catch(() => {});
             await browser.close();
         }
     }));
@@ -239,6 +265,21 @@ async function hardenContext(context: BrowserContext) {
             get: () => undefined,
         });
     });
+}
+
+async function createMobileContext(browser: Browser, storageState?: string): Promise<BrowserContext> {
+    const context = await browser.newContext({
+        ...devices['iPhone 13'],
+        locale: 'pt-BR',
+        timezoneId: 'America/Sao_Paulo',
+        geolocation: { latitude: -23.5505, longitude: -46.6333 },
+        permissions: ['geolocation'],
+        userAgent: MOBILE_USER_AGENT,
+        ...(storageState ? { storageState } : {}),
+    });
+
+    await hardenContext(context);
+    return context;
 }
 
 async function openBingHome(page: Page, log?: RunLogger) {
@@ -425,12 +466,6 @@ async function signInMobile(page: Page, username: string, password: string, log?
     emitLog(log, 'Mobile sign-in completed; reopening Bing home');
     await openBingHome(page, log);
     await closeMobileHamburgerMenu(page);
-}
-
-async function refreshMobileSession(page: Page, user: RewardUser, log?: RunLogger) {
-    emitLog(log, 'Refreshing mobile session from stored desktop state');
-    await ensureMobileLoggedOut(page, log);
-    await signInMobile(page, user.username, user.password, log);
 }
 
 async function clickContinue(page: Page) {
@@ -737,62 +772,6 @@ async function openMobileSignInEntry(page: Page): Promise<boolean> {
         page.getByRole('link', { name: /Entrar|Sign in/i }).first(),
         page.getByRole('button', { name: /Entrar|Sign in/i }).first(),
     ], 7000);
-}
-
-async function ensureMobileLoggedOut(page: Page, log?: RunLogger) {
-    await closeMobileHamburgerMenu(page);
-
-    if (!(await isSignedInSession(page))) {
-        emitLog(log, 'Mobile session is already logged out');
-        return;
-    }
-
-    emitLog(log, 'Mobile session is signed in; clearing Bing site data before mobile login');
-    await clearBingSiteData(page, log);
-    await openBingHome(page, log);
-    await closeMobileHamburgerMenu(page);
-}
-
-async function clearBingSiteData(page: Page, log?: RunLogger) {
-    emitLog(log, 'Clearing Bing cookies, storage, caches, and service workers');
-    const context = page.context();
-    const cdp = await context.newCDPSession(page);
-    const bingOrigins = [
-        'https://bing.com',
-        'https://www.bing.com',
-        'https://rewards.bing.com',
-    ];
-
-    await context.clearCookies({ domain: /(^|\.)bing\.com$/i });
-
-    for (const origin of bingOrigins) {
-        await cdp.send('Storage.clearDataForOrigin', {
-            origin,
-            storageTypes: 'all',
-        }).catch(() => {});
-    }
-
-    await cdp.detach().catch(() => {});
-
-    await page.evaluate(async () => {
-        window.localStorage.clear();
-        window.sessionStorage.clear();
-
-        if ('caches' in window) {
-            const cacheKeys = await caches.keys();
-            await Promise.all(cacheKeys.map((key) => caches.delete(key)));
-        }
-
-        if ('serviceWorker' in navigator) {
-            const registrations = await navigator.serviceWorker.getRegistrations();
-            await Promise.all(registrations.map((registration) => registration.unregister()));
-        }
-    }).catch(() => {});
-
-    await page.reload({ waitUntil: 'domcontentloaded' }).catch(async () => {
-        await openBingHome(page, log);
-    });
-    await handlePostReload(page, log);
 }
 
 async function handlePostReload(page: Page, log?: RunLogger) {

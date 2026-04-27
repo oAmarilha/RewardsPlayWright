@@ -1,12 +1,12 @@
 # Rewards Playwright 🚀
 
-Automated multi-session browsing with Playwright to run Bing searches and collect rewards more efficiently. This repo launches two desktop browsers in parallel, completes their searches, and then launches two mobile-emulated browsers reusing the same authenticated sessions.
+Automated multi-session browsing with Playwright to run Bing searches and collect rewards more efficiently. This repo launches two desktop browsers in parallel, completes their searches, and then launches two mobile-emulated browsers using their own stored mobile sessions.
 
 ## ✨ Features
 - **Parallel desktop runs**: Two Chromium instances run at the same time.
 - **Sequenced mobile runs**: Two iPhone 13–emulated sessions start after both desktop runs finish.
 - **Validated session reuse**: Desktop sessions first validate the existing `storage-*.json` files and skip login when the stored state is still usable.
-- **Mobile session refresh**: Mobile runs start from the desktop storage state, sign out inside the mobile tab, then sign back in through the mobile UI so the session is refreshed for the mobile viewport.
+- **Dedicated mobile storage**: Mobile runs reuse `storage-user*-mobile.json` when available. If a mobile storage file is missing or unusable, the run starts a clean mobile session, signs in with credentials, and saves the mobile state.
 - **Verbose runtime logging**: Live logs show storage reuse decisions, cookie validity summaries, login steps, desktop/mobile search counters, cooldowns, and reloads.
 - **Configurable via .env**: Control credentials and search settings without code changes.
 - **Resilient sign-in flow**: Handles cookies, remembered-account pickers, and typical Microsoft post‑login prompts (e.g., "Yes", "Skip for now").
@@ -92,13 +92,14 @@ The run now prints live progress to stdout, including whether stored cookies wil
    - Performs `DESKTOP_SEARCHES` random queries
    - Saves storage state to `storage-user1.json` and `storage-user2.json`
 4. Launches two iPhone 13–emulated sessions in parallel.
-   - Loads the saved desktop storage state
-   - Signs out in the mobile tab, then signs back in from the mobile UI so Microsoft refreshes the session for mobile
+   - Reuses `storage-user1-mobile.json` and `storage-user2-mobile.json` when valid
+   - If mobile storage is missing or unusable, starts without stored cookies, signs in with credentials, and saves the mobile JSON after login
    - Performs `MOBILE_SEARCHES` random queries (with optional page reloads)
 
 ## 🗂️ Storage State
-- Auth states are persisted to `storage-user1.json` and `storage-user2.json` in the project root.
-- When those files still contain usable cookies, the desktop flow reuses them instead of forcing a new login.
+- Desktop auth states are persisted to `storage-user1.json` and `storage-user2.json` in the project root.
+- Mobile auth states are persisted separately to `storage-user1-mobile.json` and `storage-user2-mobile.json`.
+- When those files still contain usable cookies, the matching desktop or mobile flow reuses them instead of forcing a new login.
 - These files are ignored by Git to protect your sessions.
 
 ## 🧩 Tips
