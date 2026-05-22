@@ -1,19 +1,28 @@
 import 'dotenv/config';
 import fs from 'node:fs/promises';
-import { chromium } from 'playwright-extra';
-import stealth from 'puppeteer-extra-plugin-stealth';
-import { test, request, Browser, BrowserContext, Page, APIRequestContext, devices, Locator } from '@playwright/test';
-
-const stealthPlugin = stealth();
-// We already manage UA/locale at the browser-context level, and this evasion
-// expects a Chrome-like UA that conflicts with the custom Firefox-style UA used here.
-stealthPlugin.enabledEvasions.delete('user-agent-override');
-chromium.use(stealthPlugin);
+import { test, request, chromium, Browser, BrowserContext, Page, APIRequestContext, devices, Locator } from '@playwright/test';
 
 const BING_URL = 'https://www.bing.com/';
-const DESKTOP_USER_AGENT = 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0';
-const MOBILE_USER_AGENT = 'Mozilla/5.0 (Android 14; Mobile; rv:144.0) Gecko/144.0 Firefox/144.0';
+const BROWSER_CHANNEL = process.env.BROWSER_CHANNEL?.trim() || 'msedge';
 const AUTH_COOKIE_NAMES = new Set(['_C_Auth', 'MSPAuth', 'MSPProf', 'RPSSecAuth']);
+const MIN_WAIT_BETWEEN_SEARCHES_MS = 180_000;
+const MIN_COOLDOWN_MS = 900_000;
+const DEFAULT_WAIT_JITTER_MS = 120_000;
+const DEFAULT_COOLDOWN_JITTER_MS = 600_000;
+const DEFAULT_DESKTOP_RUN_MINUTES_MIN = 30;
+const DEFAULT_DESKTOP_RUN_MINUTES_MAX = 40;
+const REWARDS_LIMIT_NOTICE_PATTERNS = [
+    /only be able to earn points for searches after/i,
+    /searches within a specific period do not qualify/i,
+    /Microsoft Rewards earning limit/i,
+    /earning limitations? when searching/i,
+    /limiting your searches in Microsoft Rewards/i,
+    /so podera ganhar pontos por pesquisas apos/i,
+    /so poderá ganhar pontos por pesquisas após/i,
+    /pesquisas dentro de um periodo especifico nao se qualificam/i,
+    /pesquisas dentro de um período específico não se qualificam/i,
+    /limitac(?:ao|ão|oes|ões).*(pesquisas|ganhar pontos)/i,
+];
 
 type RewardUser = {
     label: string;
@@ -26,9 +35,17 @@ type RewardUser = {
 type SearchOptions = {
     total: number;
     waitMs: number;
+    waitJitterMs: number;
     cooldownEvery: number;
     cooldownMs: number;
+    cooldownJitterMs: number;
+    targetDurationRangeMs?: DurationRange;
     reloadBetween?: boolean;
+};
+
+type DurationRange = {
+    minMs: number;
+    maxMs: number;
 };
 
 type StoredState = {
@@ -51,6 +68,12 @@ type StorageInspection = {
     validAuthCookies: string[];
 };
 
+type SearchRunResult = {
+    completed: number;
+    limited: boolean;
+    limitationText?: string;
+};
+
 type RunLogger = (message: string) => void;
 
 test('desktop and mobile reuse their own valid storage states', async () => {
@@ -71,15 +94,15 @@ test('desktop and mobile reuse their own valid storage states', async () => {
             label: 'user1',
             username: process.env.USER1,
             password: process.env.PASS1,
-            desktopStoragePath: 'storage-user1.json',
-            mobileStoragePath: 'storage-user1-mobile.json',
+            desktopStoragePath: 'storage-user1-edge.json',
+            mobileStoragePath: 'storage-user1-edge-mobile.json',
         },
         {
             label: 'user2',
             username: process.env.USER2,
             password: process.env.PASS2,
-            desktopStoragePath: 'storage-user2.json',
-            mobileStoragePath: 'storage-user2-mobile.json',
+            desktopStoragePath: 'storage-user2-edge.json',
+            mobileStoragePath: 'storage-user2-edge-mobile.json',
         },
     ].map((user, idx) => {
         if (!user.username || !user.password) {
@@ -95,17 +118,21 @@ test('desktop and mobile reuse their own valid storage states', async () => {
         };
     });
 
-    const desktopSearches = getSearchOptions(parseRequiredNumberEnv('DESKTOP_SEARCHES'));
-    const mobileSearches = getSearchOptions(parseRequiredNumberEnv('MOBILE_SEARCHES'), true);
-    setupLog(`Desktop searches: total=${desktopSearches.total}, wait=${desktopSearches.waitMs}ms, cooldownEvery=${desktopSearches.cooldownEvery}, cooldown=${desktopSearches.cooldownMs}ms`);
-    setupLog(`Mobile searches: total=${mobileSearches.total}, wait=${mobileSearches.waitMs}ms, cooldownEvery=${mobileSearches.cooldownEvery}, cooldown=${mobileSearches.cooldownMs}ms, reloadBetween=${mobileSearches.reloadBetween ? 'yes' : 'no'}`);
+    const desktopDurationRange = getDesktopDurationRange();
+    const desktopSearches = getSearchOptions(parseRequiredNumberEnv('DESKTOP_SEARCHES', 0), false, desktopDurationRange);
+    const mobileSearches = getSearchOptions(parseRequiredNumberEnv('MOBILE_SEARCHES', 0), true);
+    setupLog(`Browser channel: ${BROWSER_CHANNEL}`);
+    setupLog(`Mobile pacing minimums: wait>=${MIN_WAIT_BETWEEN_SEARCHES_MS}ms, cooldown>=${MIN_COOLDOWN_MS}ms; desktop uses target-duration scheduling`);
+    setupLog(`Desktop searches: total=${desktopSearches.total}, targetDuration=${formatDurationRange(desktopDurationRange)}`);
+    setupLog(`Mobile searches: total=${mobileSearches.total}, wait=${formatDelayRange(mobileSearches.waitMs, mobileSearches.waitJitterMs)}, cooldownEvery=${mobileSearches.cooldownEvery}, cooldown=${formatDelayRange(mobileSearches.cooldownMs, mobileSearches.cooldownJitterMs)}, reloadBetween=${mobileSearches.reloadBetween ? 'yes' : 'no'}`);
     setupLog(`Accounts configured: ${users.map((user) => `${user.label}=${maskUsername(user.username)}`).join(', ')}`);
 
     // Run two desktop browsers in parallel, reusing valid storage when possible.
     await Promise.all(users.map(async (u) => {
         const log = createRunLogger('desktop', u.label);
         const storageInspection = await inspectStoredState(u.desktopStoragePath);
-        const browser: Browser = await launchRewardsBrowser(DESKTOP_USER_AGENT);
+        const browser: Browser = await launchRewardsBrowser();
+        let context: BrowserContext | undefined;
 
         try {
             log(`Starting desktop session for ${maskUsername(u.username)}`);
@@ -113,36 +140,40 @@ test('desktop and mobile reuse their own valid storage states', async () => {
             log('Launching desktop browser context');
 
             const storageState = storageInspection.reusable ? u.desktopStoragePath : undefined;
-            const context: BrowserContext = await browser.newContext({
-                locale: 'pt-BR',
-                timezoneId: 'America/Sao_Paulo',
-                userAgent: DESKTOP_USER_AGENT,
-                geolocation: { latitude: -23.5505, longitude: -46.6333 },
-                permissions: ['geolocation'],
-                ...(storageState ? { storageState } : {}),
-            });
-
-            await hardenContext(context);
-
-            const page: Page = await context.newPage();
+            context = await createDesktopContext(browser, storageState);
+            let page: Page = await context.newPage();
             await openBingHome(page, log);
 
             if (await isSignedInSession(page)) {
                 log('Existing desktop session is already signed in');
             } else {
-                log('Stored desktop session is not signed in; performing fresh login');
-                await signInDesktop(page, u.username, u.password, log);
+                if (storageState) {
+                    log('Stored desktop Edge session is not signed in; restarting with a clean Edge session');
+                    await context.close();
+                    context = await createDesktopContext(browser);
+                    page = await context.newPage();
+                    await openBingHome(page, log);
+                } else {
+                    log('No reusable desktop Edge storage found; starting with a clean Edge session');
+                }
+
+                // await signInDesktop(page, u.username, u.password, log);
+                await context.storageState({ path: u.desktopStoragePath });
+                log(`Saved desktop Edge storage state to ${u.desktopStoragePath} after login`);
             }
 
-            await runSearches(page, words_array, desktopSearches, log, 'desktop');
+            const searchResult = await runSearches(page, words_array, desktopSearches, log, 'desktop');
+            log(describeSearchResult(searchResult, desktopSearches.total));
             await context.storageState({ path: u.desktopStoragePath });
-            log(`Saved desktop storage state to ${u.desktopStoragePath}`);
+            log(`Saved desktop Edge storage state to ${u.desktopStoragePath}`);
             await context.close();
+            context = undefined;
             log('Desktop session completed');
         } catch (error) {
             log(`Desktop session failed: ${formatError(error)}`);
             throw error;
         } finally {
+            await context?.close().catch(() => {});
             await browser.close();
         }
     }));
@@ -153,7 +184,7 @@ test('desktop and mobile reuse their own valid storage states', async () => {
     await Promise.all(users.map(async (u) => {
         const log = createRunLogger('mobile', u.label);
         const storageInspection = await inspectStoredState(u.mobileStoragePath);
-        const browser: Browser = await launchRewardsBrowser(MOBILE_USER_AGENT);
+        const browser: Browser = await launchRewardsBrowser();
         let context: BrowserContext | undefined;
 
         try {
@@ -170,23 +201,24 @@ test('desktop and mobile reuse their own valid storage states', async () => {
                 log('Existing mobile session is already signed in');
             } else {
                 if (storageState) {
-                    log('Stored mobile session is not signed in; restarting with a clean mobile session');
+                    log('Stored mobile Edge session is not signed in; restarting with a clean mobile Edge session');
                     await context.close();
                     context = await createMobileContext(browser);
                     page = await context.newPage();
                     await openBingHome(page, log);
                 } else {
-                    log('No reusable mobile storage found; starting with a clean mobile session');
+                    log('No reusable mobile Edge storage found; starting with a clean mobile Edge session');
                 }
 
-                await signInMobile(page, u.username, u.password, log);
+                // await signInMobile(page, u.username, u.password, log);
                 await context.storageState({ path: u.mobileStoragePath });
-                log(`Saved mobile storage state to ${u.mobileStoragePath} after login`);
+                log(`Saved mobile Edge storage state to ${u.mobileStoragePath} after login`);
             }
 
-            await runSearches(page, words_array, mobileSearches, log, 'mobile');
+            const searchResult = await runSearches(page, words_array, mobileSearches, log, 'mobile');
+            log(describeSearchResult(searchResult, mobileSearches.total));
             await context.storageState({ path: u.mobileStoragePath });
-            log(`Saved mobile storage state to ${u.mobileStoragePath}`);
+            log(`Saved mobile Edge storage state to ${u.mobileStoragePath}`);
             await context.close();
             context = undefined;
             log('Mobile session completed');
@@ -201,20 +233,55 @@ test('desktop and mobile reuse their own valid storage states', async () => {
     setupLog('Rewards run finished');
 });
 
-function getSearchOptions(total: number, reloadBetween = false): SearchOptions {
+function getSearchOptions(total: number, reloadBetween = false, targetDurationRangeMs?: DurationRange): SearchOptions {
+    const waitMs = parseRequiredNumberEnv('WAIT_MS', 0);
+    const cooldownMs = parseRequiredNumberEnv('COOLDOWN_MS', 0);
+    const waitJitterMs = parseOptionalNumberEnv('WAIT_JITTER_MS', DEFAULT_WAIT_JITTER_MS, 0);
+    const cooldownJitterMs = parseOptionalNumberEnv('COOLDOWN_JITTER_MS', DEFAULT_COOLDOWN_JITTER_MS, 0);
+
     return {
         total,
-        waitMs: parseRequiredNumberEnv('WAIT_MS'),
-        cooldownEvery: parseRequiredNumberEnv('COOLDOWN_EVERY'),
-        cooldownMs: parseRequiredNumberEnv('COOLDOWN_MS'),
+        waitMs: Math.max(waitMs, MIN_WAIT_BETWEEN_SEARCHES_MS),
+        waitJitterMs,
+        cooldownEvery: parseRequiredNumberEnv('COOLDOWN_EVERY', 1),
+        cooldownMs: Math.max(cooldownMs, MIN_COOLDOWN_MS),
+        cooldownJitterMs,
+        targetDurationRangeMs,
         reloadBetween,
     };
 }
 
-function parseRequiredNumberEnv(name: string): number {
+function getDesktopDurationRange(): DurationRange {
+    const minMinutes = parseOptionalNumberEnv('DESKTOP_RUN_MINUTES_MIN', DEFAULT_DESKTOP_RUN_MINUTES_MIN, 1);
+    const maxMinutes = parseOptionalNumberEnv('DESKTOP_RUN_MINUTES_MAX', DEFAULT_DESKTOP_RUN_MINUTES_MAX, 1);
+    if (maxMinutes < minMinutes) {
+        throw new Error('DESKTOP_RUN_MINUTES_MAX must be greater than or equal to DESKTOP_RUN_MINUTES_MIN');
+    }
+
+    return {
+        minMs: minMinutes * 60_000,
+        maxMs: maxMinutes * 60_000,
+    };
+}
+
+function parseRequiredNumberEnv(name: string, minimum: number): number {
     const parsed = Number.parseInt(process.env[name] ?? '', 10);
-    if (Number.isNaN(parsed)) {
-        throw new Error(`Missing or invalid ${name} environment variable`);
+    if (!Number.isInteger(parsed) || parsed < minimum) {
+        throw new Error(`Missing or invalid ${name} environment variable; expected an integer >= ${minimum}`);
+    }
+
+    return parsed;
+}
+
+function parseOptionalNumberEnv(name: string, fallback: number, minimum: number): number {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isInteger(parsed) || parsed < minimum) {
+        throw new Error(`Invalid ${name} environment variable; expected an integer >= ${minimum}`);
     }
 
     return parsed;
@@ -243,43 +310,39 @@ async function acceptCookiesIfVisible(page: Page, log?: RunLogger) {
     }
 }
 
-async function launchRewardsBrowser(userAgent: string): Promise<Browser> {
-    return chromium.launch({
-        args: [
-            '--no-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=VizDisplayCompositor',
-            '--disable-dev-shm-usage',
-            '--disable-web-security',
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-site-isolation-trials',
-            '--disable-ipc-flooding-protection',
-            `--user-agent=${userAgent}`,
-        ],
-    });
+async function launchRewardsBrowser(): Promise<Browser> {
+    try {
+        return await chromium.launch({
+            channel: BROWSER_CHANNEL,
+            args: [
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+            ],
+        });
+    } catch (error) {
+        throw new Error(`Unable to launch Playwright browser channel "${BROWSER_CHANNEL}". Install Microsoft Edge with "npx playwright install msedge" or set BROWSER_CHANNEL to an installed Chromium channel. ${formatError(error)}`);
+    }
 }
 
-async function hardenContext(context: BrowserContext) {
-    await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined,
-        });
+async function createDesktopContext(browser: Browser, storageState?: string): Promise<BrowserContext> {
+    return browser.newContext({
+        locale: 'pt-BR',
+        timezoneId: 'America/Sao_Paulo',
+        geolocation: { latitude: -23.5505, longitude: -46.6333 },
+        permissions: ['geolocation'],
+        ...(storageState ? { storageState } : {}),
     });
 }
 
 async function createMobileContext(browser: Browser, storageState?: string): Promise<BrowserContext> {
-    const context = await browser.newContext({
+    return browser.newContext({
         ...devices['iPhone 13'],
         locale: 'pt-BR',
         timezoneId: 'America/Sao_Paulo',
         geolocation: { latitude: -23.5505, longitude: -46.6333 },
         permissions: ['geolocation'],
-        userAgent: MOBILE_USER_AGENT,
         ...(storageState ? { storageState } : {}),
     });
-
-    await hardenContext(context);
-    return context;
 }
 
 async function openBingHome(page: Page, log?: RunLogger) {
@@ -777,6 +840,10 @@ async function openMobileSignInEntry(page: Page): Promise<boolean> {
 async function handlePostReload(page: Page, log?: RunLogger) {
     await page.waitForLoadState('networkidle').catch(() => {});
     await acceptCookiesIfVisible(page, log);
+    const limitationText = await getRewardsLimitNotice(page);
+    if (limitationText) {
+        emitLog(log, `Rewards earning limit notice detected after reload: ${limitationText}`);
+    }
 }
 
 async function ensureSearchField(page: Page): Promise<Locator> {
@@ -788,30 +855,207 @@ async function ensureSearchField(page: Page): Promise<Locator> {
 async function runSearches(
     page: Page,
     wordsArray: string[],
-    opts: { total: number; waitMs: number; cooldownEvery: number; cooldownMs: number; reloadBetween?: boolean },
+    opts: SearchOptions,
     log?: RunLogger,
     mode = 'search'
-) {
+): Promise<SearchRunResult> {
     emitLog(log, `Starting ${mode} loop with ${opts.total} searches`);
     let searchField = await ensureSearchField(page);
+
+    const initialLimitationText = await getRewardsLimitNotice(page);
+    if (initialLimitationText) {
+        emitLog(log, `Stopping ${mode} loop before searching because Rewards reported an earning limit: ${initialLimitationText}`);
+        return { completed: 0, limited: true, limitationText: initialLimitationText };
+    }
+
+    const delayPlan = createDelayPlan(opts);
+    if (delayPlan.targetDurationMs !== undefined) {
+        emitLog(log, `Selected ${mode} run duration: ${formatDurationMs(delayPlan.targetDurationMs)} for ${opts.total} searches`);
+    }
+
     for (let i = 0; i < opts.total; i++) {
         const query = getRandomWords(wordsArray, 3).join(' ');
         emitLog(log, `Search ${i + 1}/${opts.total}: "${query}"`);
         await searchField.fill(query);
         await searchField.press('Enter');
-        if ((i + 1) % opts.cooldownEvery === 0) {
-            emitLog(log, `Cooldown after search ${i + 1}/${opts.total} for ${opts.cooldownMs}ms`);
-            await page.waitForTimeout(opts.cooldownMs);
+
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+        const limitationText = await getRewardsLimitNotice(page);
+        if (limitationText) {
+            emitLog(log, `Stopping ${mode} loop after search ${i + 1}/${opts.total} because Rewards reported an earning limit: ${limitationText}`);
+            return { completed: i + 1, limited: true, limitationText };
         }
-        await page.waitForTimeout(opts.waitMs);
-        if (opts.reloadBetween) {
-            emitLog(log, `Reloading page before the next ${mode} search`);
+
+        if ((i + 1) < opts.total && opts.reloadBetween) {
+            emitLog(log, `Reloading page before scheduling the next ${mode} search`);
             await page.reload();
             await handlePostReload(page, log);
+
+            const reloadLimitationText = await getRewardsLimitNotice(page);
+            if (reloadLimitationText) {
+                emitLog(log, `Stopping ${mode} loop after reload because Rewards reported an earning limit: ${reloadLimitationText}`);
+                return { completed: i + 1, limited: true, limitationText: reloadLimitationText };
+            }
+
+            searchField = await ensureSearchField(page);
+        }
+
+        if ((i + 1) < opts.total) {
+            const delay = delayPlan.delays[i];
+            emitLog(log, describeNextSearchDelay(delay, mode));
+            await page.waitForTimeout(delay.totalMs);
             searchField = await ensureSearchField(page);
         }
     }
     emitLog(log, `Finished ${mode} loop`);
+    return { completed: opts.total, limited: false };
+}
+
+type NextSearchDelay = {
+    totalMs: number;
+    details: string[];
+};
+
+type SearchDelayPlan = {
+    delays: NextSearchDelay[];
+    targetDurationMs?: number;
+};
+
+function createDelayPlan(opts: SearchOptions): SearchDelayPlan {
+    const intervals = Math.max(0, opts.total - 1);
+    if (intervals === 0) {
+        return { delays: [] };
+    }
+
+    if (opts.targetDurationRangeMs) {
+        const targetDurationMs = randomInteger(opts.targetDurationRangeMs.minMs, opts.targetDurationRangeMs.maxMs);
+        return {
+            delays: createTargetDurationDelays(opts, targetDurationMs, intervals),
+            targetDurationMs,
+        };
+    }
+
+    return {
+        delays: Array.from({ length: intervals }, (_, index) => getDelayBeforeNextSearch(opts, index + 1)),
+    };
+}
+
+function createTargetDurationDelays(opts: SearchOptions, targetDurationMs: number, intervals: number): NextSearchDelay[] {
+    const weights = Array.from({ length: intervals }, (_, index) => {
+        const completedSearches = index + 1;
+        const longerPauseWeight = completedSearches % opts.cooldownEvery === 0 ? 1.45 : 1;
+        return longerPauseWeight * (0.75 + Math.random() * 0.5);
+    });
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+    let allocatedMs = 0;
+
+    return weights.map((weight, index) => {
+        const isLastInterval = index === intervals - 1;
+        const totalMs = isLastInterval
+            ? Math.max(1, targetDurationMs - allocatedMs)
+            : Math.max(1, Math.floor((targetDurationMs * weight) / totalWeight));
+        allocatedMs += totalMs;
+
+        const completedSearches = index + 1;
+        const details = [
+            `durationWindow=${formatDurationMs(targetDurationMs)}`,
+            `interval=${index + 1}/${intervals}`,
+        ];
+
+        if (completedSearches % opts.cooldownEvery === 0) {
+            details.push('longerPause=yes');
+        }
+
+        return { totalMs, details };
+    });
+}
+
+function getDelayBeforeNextSearch(opts: SearchOptions, completedSearches: number): NextSearchDelay {
+    const waitExtraMs = randomInteger(0, opts.waitJitterMs);
+    const shouldCooldown = completedSearches % opts.cooldownEvery === 0;
+    const baseCooldownMs = shouldCooldown ? opts.cooldownMs : 0;
+    const cooldownExtraMs = shouldCooldown ? randomInteger(0, opts.cooldownJitterMs) : 0;
+    const totalMs = opts.waitMs + waitExtraMs + baseCooldownMs + cooldownExtraMs;
+    const details = [
+        `wait=${opts.waitMs}+${waitExtraMs}ms`,
+    ];
+
+    if (baseCooldownMs > 0 || cooldownExtraMs > 0) {
+        details.push(`cooldown=${baseCooldownMs}+${cooldownExtraMs}ms`);
+    }
+
+    return {
+        totalMs,
+        details,
+    };
+}
+
+function randomInteger(minimum: number, maximum: number): number {
+    return Math.floor(Math.random() * (maximum - minimum + 1)) + minimum;
+}
+
+function describeNextSearchDelay(delay: NextSearchDelay, mode: string): string {
+    const nextSearchAt = new Date(Date.now() + delay.totalMs);
+    return `Next ${mode} search scheduled at ${nextSearchAt.toISOString()} (${delay.details.join(', ')}, total=${delay.totalMs}ms)`;
+}
+
+async function getRewardsLimitNotice(page: Page): Promise<string | undefined> {
+    const bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+    const normalized = normalizeNoticeText(bodyText);
+    if (!normalized || !/(Microsoft Rewards|Rewards|recompensas|pontos)/i.test(normalized)) {
+        return undefined;
+    }
+
+    const matchedPattern = REWARDS_LIMIT_NOTICE_PATTERNS.find((pattern) => pattern.test(normalized));
+    if (!matchedPattern) {
+        return undefined;
+    }
+
+    return extractNoticeSnippet(normalized, matchedPattern);
+}
+
+function normalizeNoticeText(value: string): string {
+    return value
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function extractNoticeSnippet(text: string, pattern: RegExp): string {
+    const match = pattern.exec(text);
+    if (!match || match.index < 0) {
+        return 'Rewards earning limit notice detected';
+    }
+
+    const start = Math.max(0, match.index - 120);
+    const end = Math.min(text.length, match.index + 240);
+    return text.slice(start, end).trim();
+}
+
+function describeSearchResult(result: SearchRunResult, requestedTotal: number): string {
+    if (result.limited) {
+        return `Stopped after ${result.completed}/${requestedTotal} searches because a Rewards earning limit notice was detected`;
+    }
+
+    return `Completed ${result.completed}/${requestedTotal} searches without seeing a Rewards earning limit notice`;
+}
+
+function formatDelayRange(baseMs: number, jitterMs: number): string {
+    return `${baseMs}-${baseMs + jitterMs}ms`;
+}
+
+function formatDurationRange(range: DurationRange): string {
+    return `${formatDurationMs(range.minMs)}-${formatDurationMs(range.maxMs)}`;
+}
+
+function formatDurationMs(ms: number): string {
+    const totalSeconds = Math.round(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
 }
 
 function createRunLogger(stage: string, userLabel?: string): RunLogger {

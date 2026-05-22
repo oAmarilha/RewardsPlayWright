@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "postinstall": "npx playwright install --with-deps chromium"
+    "postinstall": "npx playwright install --with-deps msedge"
   },
   "keywords": [],
   "author": "",
@@ -14,8 +14,6 @@
     "@types/node": "^22.15.20"
   },
   "dependencies": {
-    "dotenv": "^17.2.2",
-    "playwright-extra": "^4.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "dotenv": "^17.2.2"
   }
 }
