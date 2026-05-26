@@ -5,12 +5,11 @@ import { test, request, chromium, Browser, BrowserContext, Page, APIRequestConte
 const BING_URL = 'https://www.bing.com/';
 const BROWSER_CHANNEL = process.env.BROWSER_CHANNEL?.trim() || 'msedge';
 const AUTH_COOKIE_NAMES = new Set(['_C_Auth', 'MSPAuth', 'MSPProf', 'RPSSecAuth']);
-const MIN_WAIT_BETWEEN_SEARCHES_MS = 180_000;
-const MIN_COOLDOWN_MS = 900_000;
-const DEFAULT_WAIT_JITTER_MS = 120_000;
-const DEFAULT_COOLDOWN_JITTER_MS = 600_000;
 const DEFAULT_DESKTOP_RUN_MINUTES_MIN = 30;
 const DEFAULT_DESKTOP_RUN_MINUTES_MAX = 40;
+const DEFAULT_RUN_DESKTOP_SEARCHES = true;
+const DEFAULT_RUN_MOBILE_SEARCHES = true;
+const DEFAULT_DESKTOP_DURATION_WINDOW_ENABLED = true;
 const REWARDS_LIMIT_NOTICE_PATTERNS = [
     /only be able to earn points for searches after/i,
     /searches within a specific period do not qualify/i,
@@ -35,10 +34,8 @@ type RewardUser = {
 type SearchOptions = {
     total: number;
     waitMs: number;
-    waitJitterMs: number;
     cooldownEvery: number;
     cooldownMs: number;
-    cooldownJitterMs: number;
     targetDurationRangeMs?: DurationRange;
     reloadBetween?: boolean;
 };
@@ -79,6 +76,17 @@ type RunLogger = (message: string) => void;
 test('desktop and mobile reuse their own valid storage states', async () => {
     const setupLog = createRunLogger('setup');
     setupLog('Starting Bing Rewards Playwright run');
+    const runDesktopSearches = parseOptionalBooleanEnv('RUN_DESKTOP_SEARCHES', DEFAULT_RUN_DESKTOP_SEARCHES);
+    const runMobileSearches = parseOptionalBooleanEnv('RUN_MOBILE_SEARCHES', DEFAULT_RUN_MOBILE_SEARCHES);
+    const desktopDurationWindowEnabled = parseOptionalBooleanEnv('DESKTOP_DURATION_WINDOW_ENABLED', DEFAULT_DESKTOP_DURATION_WINDOW_ENABLED);
+
+    setupLog(`Browser channel: ${BROWSER_CHANNEL}`);
+    setupLog(`Search phases: desktop=${formatEnabled(runDesktopSearches)}, mobile=${formatEnabled(runMobileSearches)}; phase order=desktop parallel group, then mobile parallel group`);
+
+    if (!runDesktopSearches && !runMobileSearches) {
+        setupLog('No search phases are enabled; exiting without launching browser sessions');
+        return;
+    }
 
     // Prepare API and word list
     const api: APIRequestContext = await request.newContext({ baseURL: 'https://api.datamuse.com/', timeout: 10000 });
@@ -118,135 +126,150 @@ test('desktop and mobile reuse their own valid storage states', async () => {
         };
     });
 
-    const desktopDurationRange = getDesktopDurationRange();
-    const desktopSearches = getSearchOptions(parseRequiredNumberEnv('DESKTOP_SEARCHES', 0), false, desktopDurationRange);
-    const mobileSearches = getSearchOptions(parseRequiredNumberEnv('MOBILE_SEARCHES', 0), true);
-    setupLog(`Browser channel: ${BROWSER_CHANNEL}`);
-    setupLog(`Mobile pacing minimums: wait>=${MIN_WAIT_BETWEEN_SEARCHES_MS}ms, cooldown>=${MIN_COOLDOWN_MS}ms; desktop uses target-duration scheduling`);
-    setupLog(`Desktop searches: total=${desktopSearches.total}, targetDuration=${formatDurationRange(desktopDurationRange)}`);
-    setupLog(`Mobile searches: total=${mobileSearches.total}, wait=${formatDelayRange(mobileSearches.waitMs, mobileSearches.waitJitterMs)}, cooldownEvery=${mobileSearches.cooldownEvery}, cooldown=${formatDelayRange(mobileSearches.cooldownMs, mobileSearches.cooldownJitterMs)}, reloadBetween=${mobileSearches.reloadBetween ? 'yes' : 'no'}`);
+    const desktopDurationRange = runDesktopSearches && desktopDurationWindowEnabled ? getDesktopDurationRange() : undefined;
+    const desktopSearches = runDesktopSearches
+        ? getSearchOptions(parseRequiredNumberEnv('DESKTOP_SEARCHES', 0), false, { targetDurationRangeMs: desktopDurationRange })
+        : undefined;
+    const mobileSearches = runMobileSearches
+        ? getSearchOptions(parseRequiredNumberEnv('MOBILE_SEARCHES', 0), true, {})
+        : undefined;
+    setupLog(desktopSearches ? describeSearchOptions('Desktop', desktopSearches, desktopDurationRange) : 'Desktop searches: disabled');
+    setupLog(mobileSearches ? describeSearchOptions('Mobile', mobileSearches) : 'Mobile searches: disabled');
     setupLog(`Accounts configured: ${users.map((user) => `${user.label}=${maskUsername(user.username)}`).join(', ')}`);
 
-    // Run two desktop browsers in parallel, reusing valid storage when possible.
-    await Promise.all(users.map(async (u) => {
-        const log = createRunLogger('desktop', u.label);
-        const storageInspection = await inspectStoredState(u.desktopStoragePath);
-        const browser: Browser = await launchRewardsBrowser();
-        let context: BrowserContext | undefined;
+    if (desktopSearches) {
+        setupLog(`Starting desktop phase: ${users.map((user) => user.label).join(', ')} will run simultaneously`);
+        await Promise.all(users.map((u) => runDesktopSession(u, words_array, desktopSearches)));
+        setupLog('Desktop phase finished for all enabled users');
+    } else {
+        setupLog('Skipping desktop phase because RUN_DESKTOP_SEARCHES=false');
+    }
 
-        try {
-            log(`Starting desktop session for ${maskUsername(u.username)}`);
-            log(describeStorageInspection(u.desktopStoragePath, storageInspection));
-            log('Launching desktop browser context');
+    if (mobileSearches) {
+        setupLog(`Starting mobile phase: ${users.map((user) => user.label).join(', ')} will run simultaneously`);
+        await Promise.all(users.map((u) => runMobileSession(u, words_array, mobileSearches)));
+        setupLog('Mobile phase finished for all enabled users');
+    } else {
+        setupLog('Skipping mobile phase because RUN_MOBILE_SEARCHES=false');
+    }
 
-            const storageState = storageInspection.reusable ? u.desktopStoragePath : undefined;
-            context = await createDesktopContext(browser, storageState);
-            let page: Page = await context.newPage();
-            await openBingHome(page, log);
-
-            if (await isSignedInSession(page)) {
-                log('Existing desktop session is already signed in');
-            } else {
-                if (storageState) {
-                    log('Stored desktop Edge session is not signed in; restarting with a clean Edge session');
-                    await context.close();
-                    context = await createDesktopContext(browser);
-                    page = await context.newPage();
-                    await openBingHome(page, log);
-                } else {
-                    log('No reusable desktop Edge storage found; starting with a clean Edge session');
-                }
-
-                // await signInDesktop(page, u.username, u.password, log);
-                await context.storageState({ path: u.desktopStoragePath });
-                log(`Saved desktop Edge storage state to ${u.desktopStoragePath} after login`);
-            }
-
-            const searchResult = await runSearches(page, words_array, desktopSearches, log, 'desktop');
-            log(describeSearchResult(searchResult, desktopSearches.total));
-            await context.storageState({ path: u.desktopStoragePath });
-            log(`Saved desktop Edge storage state to ${u.desktopStoragePath}`);
-            await context.close();
-            context = undefined;
-            log('Desktop session completed');
-        } catch (error) {
-            log(`Desktop session failed: ${formatError(error)}`);
-            throw error;
-        } finally {
-            await context?.close().catch(() => {});
-            await browser.close();
-        }
-    }));
-    setupLog('All desktop sessions finished; starting mobile sessions');
-
-    // After desktop finishes, mobile uses its own storage state. If there is no
-    // reusable mobile state, start clean and save a new mobile-specific state.
-    await Promise.all(users.map(async (u) => {
-        const log = createRunLogger('mobile', u.label);
-        const storageInspection = await inspectStoredState(u.mobileStoragePath);
-        const browser: Browser = await launchRewardsBrowser();
-        let context: BrowserContext | undefined;
-
-        try {
-            log(`Starting mobile session for ${maskUsername(u.username)}`);
-            log(describeStorageInspection(u.mobileStoragePath, storageInspection));
-            log('Launching mobile browser context');
-
-            const storageState = storageInspection.reusable ? u.mobileStoragePath : undefined;
-            context = await createMobileContext(browser, storageState);
-            let page: Page = await context.newPage();
-            await openBingHome(page, log);
-
-            if (await isSignedInSession(page)) {
-                log('Existing mobile session is already signed in');
-            } else {
-                if (storageState) {
-                    log('Stored mobile Edge session is not signed in; restarting with a clean mobile Edge session');
-                    await context.close();
-                    context = await createMobileContext(browser);
-                    page = await context.newPage();
-                    await openBingHome(page, log);
-                } else {
-                    log('No reusable mobile Edge storage found; starting with a clean mobile Edge session');
-                }
-
-                // await signInMobile(page, u.username, u.password, log);
-                await context.storageState({ path: u.mobileStoragePath });
-                log(`Saved mobile Edge storage state to ${u.mobileStoragePath} after login`);
-            }
-
-            const searchResult = await runSearches(page, words_array, mobileSearches, log, 'mobile');
-            log(describeSearchResult(searchResult, mobileSearches.total));
-            await context.storageState({ path: u.mobileStoragePath });
-            log(`Saved mobile Edge storage state to ${u.mobileStoragePath}`);
-            await context.close();
-            context = undefined;
-            log('Mobile session completed');
-        } catch (error) {
-            log(`Mobile session failed: ${formatError(error)}`);
-            throw error;
-        } finally {
-            await context?.close().catch(() => {});
-            await browser.close();
-        }
-    }));
     setupLog('Rewards run finished');
 });
 
-function getSearchOptions(total: number, reloadBetween = false, targetDurationRangeMs?: DurationRange): SearchOptions {
+async function runDesktopSession(u: RewardUser, wordsArray: string[], desktopSearches: SearchOptions) {
+    const log = createRunLogger('desktop', u.label);
+    const storageInspection = await inspectStoredState(u.desktopStoragePath);
+    const browser: Browser = await launchRewardsBrowser();
+    let context: BrowserContext | undefined;
+
+    try {
+        log(`Session starting for ${maskUsername(u.username)}; storage=${u.desktopStoragePath}`);
+        log(describeStorageInspection(u.desktopStoragePath, storageInspection));
+        log('Launching desktop browser context');
+
+        const storageState = storageInspection.reusable ? u.desktopStoragePath : undefined;
+        context = await createDesktopContext(browser, storageState);
+        let page: Page = await context.newPage();
+        await openBingHome(page, log);
+
+        if (await isSignedInSession(page)) {
+            log('Existing desktop session is already signed in');
+        } else {
+            if (storageState) {
+                log('Stored desktop Edge session is not signed in; restarting with a clean Edge session');
+                await context.close();
+                context = await createDesktopContext(browser);
+                page = await context.newPage();
+                await openBingHome(page, log);
+            } else {
+                log('No reusable desktop Edge storage found; starting with a clean Edge session');
+            }
+
+            // await signInDesktop(page, u.username, u.password, log);
+            await context.storageState({ path: u.desktopStoragePath });
+            log(`Saved desktop Edge storage state to ${u.desktopStoragePath} after session setup`);
+        }
+
+        const searchResult = await runSearches(page, wordsArray, desktopSearches, log, 'desktop');
+        log(describeSearchResult(searchResult, desktopSearches.total));
+        await context.storageState({ path: u.desktopStoragePath });
+        log(`Saved desktop Edge storage state to ${u.desktopStoragePath}`);
+        await context.close();
+        context = undefined;
+        log('Session completed');
+    } catch (error) {
+        log(`Desktop session failed: ${formatError(error)}`);
+        throw error;
+    } finally {
+        await context?.close().catch(() => {});
+        await browser.close();
+    }
+}
+
+async function runMobileSession(u: RewardUser, wordsArray: string[], mobileSearches: SearchOptions) {
+    const log = createRunLogger('mobile', u.label);
+    const storageInspection = await inspectStoredState(u.mobileStoragePath);
+    const browser: Browser = await launchRewardsBrowser();
+    let context: BrowserContext | undefined;
+
+    try {
+        log(`Session starting for ${maskUsername(u.username)}; storage=${u.mobileStoragePath}`);
+        log(describeStorageInspection(u.mobileStoragePath, storageInspection));
+        log('Launching mobile browser context');
+
+        const storageState = storageInspection.reusable ? u.mobileStoragePath : undefined;
+        context = await createMobileContext(browser, storageState);
+        let page: Page = await context.newPage();
+        await openBingHome(page, log);
+
+        if (await isSignedInSession(page)) {
+            log('Existing mobile session is already signed in');
+        } else {
+            if (storageState) {
+                log('Stored mobile Edge session is not signed in; restarting with a clean mobile Edge session');
+                await context.close();
+                context = await createMobileContext(browser);
+                page = await context.newPage();
+                await openBingHome(page, log);
+            } else {
+                log('No reusable mobile Edge storage found; starting with a clean mobile Edge session');
+            }
+
+            // await signInMobile(page, u.username, u.password, log);
+            await context.storageState({ path: u.mobileStoragePath });
+            log(`Saved mobile Edge storage state to ${u.mobileStoragePath} after session setup`);
+        }
+
+        const searchResult = await runSearches(page, wordsArray, mobileSearches, log, 'mobile');
+        log(describeSearchResult(searchResult, mobileSearches.total));
+        await context.storageState({ path: u.mobileStoragePath });
+        log(`Saved mobile Edge storage state to ${u.mobileStoragePath}`);
+        await context.close();
+        context = undefined;
+        log('Session completed');
+    } catch (error) {
+        log(`Mobile session failed: ${formatError(error)}`);
+        throw error;
+    } finally {
+        await context?.close().catch(() => {});
+        await browser.close();
+    }
+}
+
+type SearchOptionsConfig = {
+    targetDurationRangeMs?: DurationRange;
+};
+
+function getSearchOptions(total: number, reloadBetween = false, config: SearchOptionsConfig): SearchOptions {
     const waitMs = parseRequiredNumberEnv('WAIT_MS', 0);
     const cooldownMs = parseRequiredNumberEnv('COOLDOWN_MS', 0);
-    const waitJitterMs = parseOptionalNumberEnv('WAIT_JITTER_MS', DEFAULT_WAIT_JITTER_MS, 0);
-    const cooldownJitterMs = parseOptionalNumberEnv('COOLDOWN_JITTER_MS', DEFAULT_COOLDOWN_JITTER_MS, 0);
 
     return {
         total,
-        waitMs: Math.max(waitMs, MIN_WAIT_BETWEEN_SEARCHES_MS),
-        waitJitterMs,
+        waitMs,
         cooldownEvery: parseRequiredNumberEnv('COOLDOWN_EVERY', 1),
-        cooldownMs: Math.max(cooldownMs, MIN_COOLDOWN_MS),
-        cooldownJitterMs,
-        targetDurationRangeMs,
+        cooldownMs,
+        targetDurationRangeMs: config.targetDurationRangeMs,
         reloadBetween,
     };
 }
@@ -285,6 +308,24 @@ function parseOptionalNumberEnv(name: string, fallback: number, minimum: number)
     }
 
     return parsed;
+}
+
+function parseOptionalBooleanEnv(name: string, fallback: boolean): boolean {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === '') {
+        return fallback;
+    }
+
+    const normalized = raw.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) {
+        return true;
+    }
+
+    if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) {
+        return false;
+    }
+
+    throw new Error(`Invalid ${name} environment variable; expected true/false, yes/no, on/off, or 1/0`);
 }
 
 function getRandomWords(words: string[], count: number): string[] {
@@ -973,17 +1014,15 @@ function createTargetDurationDelays(opts: SearchOptions, targetDurationMs: numbe
 }
 
 function getDelayBeforeNextSearch(opts: SearchOptions, completedSearches: number): NextSearchDelay {
-    const waitExtraMs = randomInteger(0, opts.waitJitterMs);
     const shouldCooldown = completedSearches % opts.cooldownEvery === 0;
     const baseCooldownMs = shouldCooldown ? opts.cooldownMs : 0;
-    const cooldownExtraMs = shouldCooldown ? randomInteger(0, opts.cooldownJitterMs) : 0;
-    const totalMs = opts.waitMs + waitExtraMs + baseCooldownMs + cooldownExtraMs;
+    const totalMs = opts.waitMs + baseCooldownMs;
     const details = [
-        `wait=${opts.waitMs}+${waitExtraMs}ms`,
+        `wait=${opts.waitMs}ms`,
     ];
 
-    if (baseCooldownMs > 0 || cooldownExtraMs > 0) {
-        details.push(`cooldown=${baseCooldownMs}+${cooldownExtraMs}ms`);
+    if (baseCooldownMs > 0) {
+        details.push(`cooldown=${baseCooldownMs}ms`);
     }
 
     return {
@@ -1043,8 +1082,17 @@ function describeSearchResult(result: SearchRunResult, requestedTotal: number): 
     return `Completed ${result.completed}/${requestedTotal} searches without seeing a Rewards earning limit notice`;
 }
 
-function formatDelayRange(baseMs: number, jitterMs: number): string {
-    return `${baseMs}-${baseMs + jitterMs}ms`;
+function describeSearchOptions(label: string, opts: SearchOptions, durationRange?: DurationRange): string {
+    const common = `${label} searches: total=${opts.total}, reloadBetween=${opts.reloadBetween ? 'yes' : 'no'}`;
+    if (durationRange) {
+        return `${common}, scheduling=duration-window, targetDuration=${formatDurationRange(durationRange)}`;
+    }
+
+    return `${common}, scheduling=wait/cooldown, wait=${opts.waitMs}ms, cooldownEvery=${opts.cooldownEvery}, cooldown=${opts.cooldownMs}ms`;
+}
+
+function formatEnabled(enabled: boolean): string {
+    return enabled ? 'enabled' : 'disabled';
 }
 
 function formatDurationRange(range: DurationRange): string {

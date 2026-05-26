@@ -53,15 +53,16 @@ cp .env.example .env
 - `USER2` – Email/username for account 2
 - `PASS2` – Password for account 2
 - `BROWSER_CHANNEL` – Optional Playwright Chromium channel override; defaults to `msedge`
+- `RUN_DESKTOP_SEARCHES` – Enable or disable the desktop phase; defaults to `true`
+- `RUN_MOBILE_SEARCHES` – Enable or disable the mobile phase; defaults to `true`
 - `DESKTOP_SEARCHES` – Number of searches per desktop session (default example: 32)
+- `DESKTOP_DURATION_WINDOW_ENABLED` – Enable or disable spreading desktop searches across the configured duration window; defaults to `true`
 - `DESKTOP_RUN_MINUTES_MIN` – Minimum desktop run duration in minutes; defaults to 30
 - `DESKTOP_RUN_MINUTES_MAX` – Maximum desktop run duration in minutes; defaults to 40
 - `MOBILE_SEARCHES` – Number of searches per mobile session (default example: 22)
-- `WAIT_MS` – Minimum wait time in milliseconds for mobile/non-duration schedules; the code clamps this to at least 180000
-- `WAIT_JITTER_MS` – Optional extra randomized wait added to each mobile/non-duration between-search pause (default: 120000)
+- `WAIT_MS` – Wait time in milliseconds for wait/cooldown schedules
 - `COOLDOWN_EVERY` – After how many searches to apply a cooldown pause (default example: 4)
-- `COOLDOWN_MS` – Minimum cooldown duration in milliseconds for mobile/non-duration schedules; the code clamps this to at least 900000
-- `COOLDOWN_JITTER_MS` – Optional extra randomized cooldown added to each mobile/non-duration cooldown pause (default: 600000)
+- `COOLDOWN_MS` – Cooldown duration in milliseconds for wait/cooldown schedules
 - `KEYWORD_SEARCH` – Keyword to search for (default example: "cat")
 
 > Note: `.env` is ignored by Git. Do not commit your real credentials.
@@ -79,24 +80,33 @@ Headless (CI‑style):
 npx playwright test tests/rewards.spec.ts
 ```
 
+Examples:
+
+```bash
+RUN_DESKTOP_SEARCHES=false npx playwright test tests/rewards.spec.ts
+RUN_MOBILE_SEARCHES=false DESKTOP_DURATION_WINDOW_ENABLED=false npx playwright test tests/rewards.spec.ts
+```
+
 To override credentials without a `.env` file:
 
 ```bash
 USER1='user1@example.com' PASS1='password1' USER2='user2@example.com' PASS2='password2' npx playwright test tests/rewards.spec.ts
 ```
 
-The run now prints live progress to stdout, including whether stored cookies will be reused, how many valid cookies were found, which login path was taken, the current desktop/mobile search number, and the exact next-search timestamp after each dynamic pause.
+The run now prints live progress to stdout, including enabled/disabled phases, phase concurrency, whether stored cookies will be reused, how many valid cookies were found, the current desktop/mobile search number, and the exact next-search timestamp after each scheduled pause.
 
 ## ⚙️ How It Works
 1. Loads credentials and configuration using `dotenv`.
 2. Creates an API client to fetch random words from `https://api.datamuse.com/`.
-3. Launches two desktop Microsoft Edge sessions in parallel.
+3. If `RUN_DESKTOP_SEARCHES=true`, launches two desktop Microsoft Edge sessions in parallel.
    - Navigates to `https://bing.com/`
    - Accepts cookies if prompted
    - Reuses `storage-user*-edge.json` when it is still valid; otherwise starts a clean Edge session and signs in with `USER1` and `USER2`
-   - Performs exactly `DESKTOP_SEARCHES` random queries spread across a randomly selected `DESKTOP_RUN_MINUTES_MIN` to `DESKTOP_RUN_MINUTES_MAX` window
+   - Performs exactly `DESKTOP_SEARCHES` random queries
+   - If `DESKTOP_DURATION_WINDOW_ENABLED=true`, spreads those searches across a randomly selected `DESKTOP_RUN_MINUTES_MIN` to `DESKTOP_RUN_MINUTES_MAX` window
+   - If `DESKTOP_DURATION_WINDOW_ENABLED=false`, uses only `WAIT_MS`, `COOLDOWN_EVERY`, and `COOLDOWN_MS` for timing
    - Saves storage state to `storage-user1-edge.json` and `storage-user2-edge.json`
-4. Launches two iPhone 13–emulated sessions in parallel.
+4. If `RUN_MOBILE_SEARCHES=true`, launches two iPhone 13–emulated sessions in parallel after the desktop phase finishes.
    - Reuses `storage-user1-edge-mobile.json` and `storage-user2-edge-mobile.json` when valid
    - If mobile storage is missing or unusable, starts without stored cookies, signs in with credentials, and saves the mobile JSON after login
    - Performs `MOBILE_SEARCHES` random queries with dynamically scheduled pauses and optional page reloads
